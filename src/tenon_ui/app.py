@@ -59,6 +59,13 @@ def hide_dock_icon() -> None:
     send_set(ns_app, objc.sel_registerName(b"setActivationPolicy:"), 1)  # NSApplicationActivationPolicyAccessory
 
 
+def apply_needs_terminal() -> bool:
+    """True where a detached `tenon apply` would silently skip its root steps (Linux without passwordless sudo)."""
+    if sys.platform == "darwin":
+        return False
+    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0
+
+
 def quit_app() -> None:
     """Quit; on macOS also unload the KeepAlive agent so launchd does not relaunch us."""
     if sys.platform == "darwin":
@@ -88,7 +95,7 @@ class TrayApp:
         self.debounce = QTimer(singleShot=True, interval=DEBOUNCE_MS)
         self.debounce.timeout.connect(self.refresh)
         self.fallback = QTimer(interval=FALLBACK_MS)
-        self.fallback.timeout.connect(self.refresh)
+        self.fallback.timeout.connect(self.on_fallback)
         self.watcher = QFileSystemWatcher()
         self.watcher.directoryChanged.connect(self.on_state_changed)
         self.watcher.fileChanged.connect(self.on_state_changed)
@@ -103,6 +110,10 @@ class TrayApp:
         # Files replaced atomically drop their watch, so re-add on every change.
         wanted = [STATE_DIR, *STATE_DIR.glob("*.json*")]
         self.watcher.addPaths([str(p) for p in wanted if str(p) not in self.watcher.files() + self.watcher.directories()])
+
+    def on_fallback(self) -> None:
+        self.watch_state()  # the state dir may not have existed at start
+        self.refresh()
 
     def on_state_changed(self, _path: str) -> None:
         self.watch_state()
@@ -139,10 +150,11 @@ class TrayApp:
     def on_menu_about_to_show(self) -> None:
         self.refresh()
         view = self.view
-        if view is None:
-            return
         menu = self.menu
         menu.clear()
+        if view is None:
+            menu.addAction("Loading\u2026").setEnabled(False)
+            return
 
         def label(text: str) -> None:
             if text:
@@ -160,8 +172,11 @@ class TrayApp:
         label(view.managed)
         menu.addSeparator()
         idle = view.health is not Health.RUNNING
-        self.add_run(menu, "Check for drift", "check", idle)
-        self.add_run(menu, "Apply now", "apply", idle)
+        self.add_run(menu, "Check for drift", ["check"], idle)
+        if apply_needs_terminal():
+            menu.addAction("Apply now: run `tenon apply` in a terminal").setEnabled(False)
+        else:
+            self.add_run(menu, "Apply now", ["apply"], idle)
         if view.log:
             log = view.log
             open_log = QAction("Open log", menu)
@@ -173,10 +188,10 @@ class TrayApp:
         menu.addAction(quit_action)
 
     @staticmethod
-    def add_run(menu: QMenu, text: str, verb: str, enabled: bool) -> None:
+    def add_run(menu: QMenu, text: str, args: list[str], enabled: bool) -> None:
         action = QAction(text, menu)
         action.setEnabled(enabled)
-        action.triggered.connect(lambda: QProcess.startDetached(str(CLI), [verb]))
+        action.triggered.connect(lambda: QProcess.startDetached(str(CLI), args))
         menu.addAction(action)
 
 
