@@ -18,6 +18,7 @@ DEBOUNCE_MS = 500
 FALLBACK_MS = 60_000
 PACKAGE_DIR = Path(__file__).parent
 STATUS_TIMEOUT_MS = 10_000
+UPGRADE_COMMAND = Path.home() / ".local/share/tenon/actions/upgrade.command"
 ICON_PX = 64
 COLORS = {
     Health.UNKNOWN: "#8e8e93", Health.RUNNING: "#0a84ff", Health.OK: "#30d158",
@@ -59,6 +60,10 @@ def hide_dock_icon() -> None:
         ("objc_msgSend", objc))
     ns_app = send(objc.objc_getClass(b"NSApplication"), objc.sel_registerName(b"sharedApplication"))
     send_set(ns_app, objc.sel_registerName(b"setActivationPolicy:"), 1)  # NSApplicationActivationPolicyAccessory
+
+
+def open_file(path: Path) -> None:
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
 def apply_needs_terminal() -> bool:
@@ -187,12 +192,22 @@ class TrayApp:
         label(view.detail)
         menu.addSeparator()
         label(view.last_run)
+        if view.partial:
+            label("Partial run: only part of the machine was evaluated")
         for item in view.failed:
             label(f"  failed: {item}")
         for item in view.changed:
             label(f"  {item}")
+        if view.changed_more:
+            label(f"  \u2026 and {view.changed_more} more")
         label(view.sync)
         label(view.managed)
+        if view.orphans:
+            orphans = menu.addMenu("No longer managed, still on disk")
+            for path in view.orphans:
+                orphans.addAction(path).setEnabled(False)
+            orphans.addSeparator()
+            orphans.addAction("Nothing is deleted automatically").setEnabled(False)
         menu.addSeparator()
         idle = view.health is not Health.RUNNING
         self.add_run(menu, "Check for drift", ["check"], idle)
@@ -200,11 +215,24 @@ class TrayApp:
             menu.addAction("Apply now: run `tenon apply` in a terminal").setEnabled(False)
         else:
             self.add_run(menu, "Apply now", ["apply"], idle)
+        if sys.platform == "darwin":
+            upgrade = QAction("Upgrade packages\u2026", menu)
+            upgrade.setEnabled(idle)
+            upgrade.triggered.connect(lambda: QProcess.startDetached("/usr/bin/open", [str(UPGRADE_COMMAND)]))
+            menu.addAction(upgrade)
         if view.log:
             log = view.log
             open_log = QAction("Open log", menu)
-            open_log.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(log))))
+            open_log.triggered.connect(lambda: open_file(log))
             menu.addAction(open_log)
+        if view.runs:
+            recent = menu.addMenu("Recent runs")
+            for row in view.runs:
+                item = QAction(row.text, recent)
+                item.setEnabled(row.log is not None)
+                if row.log:
+                    item.triggered.connect(lambda _=False, path=row.log: open_file(path))
+                recent.addAction(item)
         menu.addSeparator()
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(quit_app)

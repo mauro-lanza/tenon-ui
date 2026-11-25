@@ -76,6 +76,34 @@ def test_manifest_and_log(tmp_path: Path):
     assert view.managed == "Manages 2 files, 1 no longer managed"
 
 
+def test_recent_runs_newest_first_with_log_only_when_it_exists(tmp_path: Path):
+    log = tmp_path / "run.log"
+    log.write_text("")
+    history = [{"finished": "2026-11-24T09:00:01", "result": "ok", "duration_seconds": 5,
+                "changed": 0, "log": str(tmp_path / "pruned.log")},
+               {"finished": "2026-11-25T09:00:01", "result": "failed", "duration_seconds": 7,
+                "changed": 2, "partial": True, "log": str(log)}]
+    rows = build_view(run(), [], None, history, None).runs
+    assert rows[0].text == "2026-11-25 09:00*  failed  7s  (2 changed)"
+    assert rows[0].log == log
+    assert rows[1].text == "2026-11-24 09:00  ok  5s  (0 changed)"
+    assert rows[1].log is None
+
+
+def test_orphans_are_capped_and_partial_is_reported():
+    manifest = {"files": [], "orphans": [{"path": f"/o{i}"} for i in range(12)]}
+    report = run()
+    report["last_run"]["partial"] = True
+    view = build_view(report, [], None, [], manifest)
+    assert view.partial
+    assert view.orphans == tuple(f"/o{i}" for i in range(10))
+
+
+def test_changed_list_is_capped_with_remainder():
+    view = build_view(run("check", changed=[{"item": str(i)} for i in range(13)]), [], None, [], None)
+    assert len(view.changed) == 10 and view.changed_more == 3
+
+
 def test_read_jsonl_skips_partial_line(tmp_path: Path):
     path = tmp_path / "p.jsonl"
     path.write_text(json.dumps({"a": 1}) + "\n{\"b\":")

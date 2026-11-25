@@ -12,6 +12,10 @@ capabilities:
         dest: "{{ home_dir }}/Applications/Tenon.app/Contents/MacOS/tenon-ui"
         executable: true
         platform: Darwin
+      - src: macos/upgrade.command
+        dest: "{{ home_dir }}/.local/share/tenon/actions/upgrade.command"
+        executable: true
+        platform: Darwin
       - src: linux/tenon-ui.desktop
         dest: "{{ home_dir }}/.config/autostart/tenon-ui.desktop"
         platform: Linux

@@ -13,7 +13,9 @@ STATE_DIR = Path.home() / ".local/state/tenon"
 CLI = Path.home() / ".local/bin/tenon"
 # Past this with no new progress line, a run without an end marker was killed.
 STALLED_SECONDS = 300
-LISTED_ITEMS = 6
+LISTED_FAILED = 6
+LISTED_CHANGED = 10
+LISTED_ORPHANS = 10
 
 
 class Health(Enum):
@@ -36,6 +38,16 @@ class View:
     changed: tuple[str, ...]
     sync: str
     managed: str
+    log: Path | None
+    partial: bool
+    changed_more: int
+    runs: tuple["RunRow", ...]
+    orphans: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RunRow:
+    text: str
     log: Path | None
 
 
@@ -79,6 +91,15 @@ def _existing_log(history: list[dict]) -> Path | None:
         if log and Path(log).exists():
             return Path(log)
     return None
+
+
+def _run_row(entry: dict) -> RunRow:
+    """One history line; the log is linked only while it still exists (old successful ones are pruned)."""
+    when = (entry.get("finished") or "")[:16].replace("T", " ")
+    text = (f"{when}{'*' if entry.get('partial') else ''}  {entry.get('result', '?')}  "
+            f"{entry.get('duration_seconds', '?')}s  ({entry.get('changed', '?')} changed)")
+    log = entry.get("log")
+    return RunRow(text, Path(log) if log and Path(log).exists() else None)
 
 
 def _running(progress: list[dict], progress_age: float | None) -> dict | None:
@@ -142,8 +163,12 @@ def build_view(report: dict | None, progress: list[dict], progress_age: float | 
         if orphans:
             managed += f", {orphans} no longer managed"
 
-    return View(health, percent, headline, detail, last_run, failed[:LISTED_ITEMS],
-                changed[:LISTED_ITEMS], sync, managed, _existing_log(history))
+    runs = tuple(_run_row(entry) for entry in reversed(history))
+    orphans = tuple(str(e.get("path")) for e in (manifest or {}).get("orphans") or [])
+    return View(health, percent, headline, detail, last_run, failed[:LISTED_FAILED],
+                changed[:LISTED_CHANGED], sync, managed, _existing_log(history),
+                bool((status or {}).get("partial")), max(0, len(changed) - LISTED_CHANGED),
+                runs, orphans[:LISTED_ORPHANS])
 
 
 def load_view(report: dict | None, state_dir: Path = STATE_DIR) -> View:
