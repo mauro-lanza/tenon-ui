@@ -1,0 +1,5 @@
+scheduled_agents:
+  - label: com.tenon.ui
+    program: "{{ home_dir }}/Applications/Tenon.app/Contents/MacOS/tenon-ui"
+    keep_alive: true
+    requires_capability: tenon-ui

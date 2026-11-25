@@ -1,0 +1,17 @@
+---
+capabilities:
+  - id: tenon-ui
+    desc: "Tenon menu bar app"
+    packages:
+      uv: "{{ tenon_layer_cache }}/tenon-ui"
+    config:
+      - src: macos/Info.plist
+        dest: "{{ home_dir }}/Applications/Tenon.app/Contents/Info.plist"
+        platform: Darwin
+      - src: macos/tenon-ui
+        dest: "{{ home_dir }}/Applications/Tenon.app/Contents/MacOS/tenon-ui"
+        executable: true
+        platform: Darwin
+      - src: linux/tenon-ui.desktop
+        dest: "{{ home_dir }}/.config/autostart/tenon-ui.desktop"
+        platform: Linux
