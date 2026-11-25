@@ -79,7 +79,10 @@ def install_signature() -> tuple:
 
 
 def restart() -> None:
-    """Re-exec onto the new code; works with or without a supervisor."""
+    """Restart onto the new code. macOS: exit and let the KeepAlive agent relaunch, since an exec'd process loses its status item."""
+    if sys.platform == "darwin":
+        QApplication.quit()
+        return
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
@@ -130,7 +133,9 @@ class TrayApp:
     def watch_state(self) -> None:
         # Files replaced atomically drop their watch, so re-add on every change.
         wanted = [STATE_DIR, *STATE_DIR.glob("*.json*")]
-        self.watcher.addPaths([str(p) for p in wanted if str(p) not in self.watcher.files() + self.watcher.directories()])
+        missing = [str(p) for p in wanted if str(p) not in self.watcher.files() + self.watcher.directories()]
+        if missing:
+            self.watcher.addPaths(missing)
 
     def on_fallback(self) -> None:
         self.watch_state()  # the state dir may not have existed at start

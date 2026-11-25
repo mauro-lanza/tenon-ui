@@ -118,7 +118,17 @@ def test_each_completed_run_checks_the_install(tmp_path, monkeypatch):
     assert not restarts
 
 
+def test_restart_quits_on_macos_so_launchd_relaunches(monkeypatch):
+    quits = []
+    monkeypatch.setattr(tray_app.sys, "platform", "darwin")
+    monkeypatch.setattr(tray_app.QApplication, "quit", staticmethod(lambda: quits.append(1)))
+    monkeypatch.setattr(tray_app.os, "execv", lambda *a: 1 / 0)
+    tray_app.restart()
+    assert quits == [1]
+
+
 def test_restart_re_execs_the_interpreter_with_the_same_argv(monkeypatch):
+    monkeypatch.setattr(tray_app.sys, "platform", "linux")
     calls = []
     monkeypatch.setattr(tray_app.os, "execv", lambda *a: calls.append(a))
     monkeypatch.setattr(tray_app.sys, "argv", ["tenon-ui"])
