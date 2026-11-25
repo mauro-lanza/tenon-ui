@@ -114,6 +114,8 @@ class TrayApp:
         self.watch_state()
 
         self.installed = install_signature()
+        self.seen_report = False
+        self.last_finished: str | None = None
 
         self.refresh()
         self.fallback.start()
@@ -153,6 +155,10 @@ class TrayApp:
     def apply_report(self, report: dict | None) -> None:
         previous, self.view = self.view, load_view(report)
         view = self.view
+        finished = ((report or {}).get("last_run") or {}).get("finished")
+        run_completed = report is not None and self.seen_report and finished != self.last_finished
+        if report is not None:
+            self.seen_report, self.last_finished = True, finished
         self.tray.setIcon(make_icon(view.health, view.percent))
         self.tray.setToolTip(f"tenon: {view.headline}")
         if previous and previous.health is Health.RUNNING and view.health is not Health.RUNNING:
@@ -160,9 +166,9 @@ class TrayApp:
             self.tray.showMessage("tenon", view.last_run or view.headline,
                                   QSystemTrayIcon.MessageIcon.Critical if failed
                                   else QSystemTrayIcon.MessageIcon.Information)
-            if install_signature() != self.installed:
-                self.tray.hide()
-                restart()
+        if run_completed and install_signature() != self.installed:
+            self.tray.hide()
+            restart()
 
     def on_menu_about_to_show(self) -> None:
         self.refresh()

@@ -93,29 +93,28 @@ def test_install_signature_changes_when_a_source_file_is_rewritten(tmp_path, mon
     assert tray_app.install_signature() != before
 
 
-def View_for(health):
-    return tray_app.View(health, None, "", "", "", (), (), "", "", None)
+def report_finished(finished):
+    return {"last_run": {"finished": finished, "mode": "check", "result": "ok"}}
 
 
-def test_run_finish_restarts_only_when_install_changed(tmp_path, monkeypatch):
+def test_each_completed_run_checks_the_install(tmp_path, monkeypatch):
     QApplication.instance() or QApplication([])
     monkeypatch.setattr(tray_app, "PACKAGE_DIR", tmp_path)
     (tmp_path / "app.py").write_text("a")
     tray = tray_app.TrayApp(QApplication.instance())
+    tray.seen_report, tray.last_finished = False, None
     restarts = []
     monkeypatch.setattr(tray_app, "restart", lambda: restarts.append(1))
-    states = {"running": View_for(Health.RUNNING), "idle": View_for(Health.OK)}
-    monkeypatch.setattr(tray_app, "load_view", lambda report: states[report])
     (tmp_path / "app.py").write_text("bb")
-    tray.apply_report("running")
-    tray.apply_report("running")  # still running: no restart
+    tray.apply_report(report_finished("t1"))  # baseline only
+    tray.apply_report(report_finished("t1"))  # same run
+    tray.apply_report(None)  # failed status call
     assert not restarts
-    tray.apply_report("idle")
+    tray.apply_report(report_finished("t2"))  # new run, install changed
     assert restarts == [1]
     restarts.clear()
     tray.installed = tray_app.install_signature()
-    tray.apply_report("running")
-    tray.apply_report("idle")  # unchanged install
+    tray.apply_report(report_finished("t3"))  # new run, install unchanged
     assert not restarts
 
 
