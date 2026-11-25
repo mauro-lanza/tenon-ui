@@ -84,6 +84,49 @@ def test_fallback_timer_re_adds_watches(monkeypatch):
     assert calls == ["watch", "refresh"]
 
 
+def test_install_signature_changes_when_a_source_file_is_rewritten(tmp_path, monkeypatch):
+    monkeypatch.setattr(tray_app, "PACKAGE_DIR", tmp_path)
+    (tmp_path / "app.py").write_text("a")
+    before = tray_app.install_signature()
+    assert tray_app.install_signature() == before
+    (tmp_path / "app.py").write_text("bb")
+    assert tray_app.install_signature() != before
+
+
+def View_for(health):
+    return tray_app.View(health, None, "", "", "", (), (), "", "", None)
+
+
+def test_run_finish_restarts_only_when_install_changed(tmp_path, monkeypatch):
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(tray_app, "PACKAGE_DIR", tmp_path)
+    (tmp_path / "app.py").write_text("a")
+    tray = tray_app.TrayApp(QApplication.instance())
+    restarts = []
+    monkeypatch.setattr(tray_app, "restart", lambda: restarts.append(1))
+    states = {"running": View_for(Health.RUNNING), "idle": View_for(Health.OK)}
+    monkeypatch.setattr(tray_app, "load_view", lambda report: states[report])
+    (tmp_path / "app.py").write_text("bb")
+    tray.apply_report("running")
+    tray.apply_report("running")  # still running: no restart
+    assert not restarts
+    tray.apply_report("idle")
+    assert restarts == [1]
+    restarts.clear()
+    tray.installed = tray_app.install_signature()
+    tray.apply_report("running")
+    tray.apply_report("idle")  # unchanged install
+    assert not restarts
+
+
+def test_restart_re_execs_the_interpreter_with_the_same_argv(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tray_app.os, "execv", lambda *a: calls.append(a))
+    monkeypatch.setattr(tray_app.sys, "argv", ["tenon-ui"])
+    tray_app.restart()
+    assert calls == [(tray_app.sys.executable, [tray_app.sys.executable, "tenon-ui"])]
+
+
 def test_icons_render_for_every_health():
     QApplication.instance() or QApplication([])
     for health in Health:

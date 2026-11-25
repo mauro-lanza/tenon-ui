@@ -5,6 +5,7 @@ import ctypes.util
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QProcess, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
@@ -15,6 +16,7 @@ from tenon_ui.state import CLI, STATE_DIR, Health, View, load_view, parse_report
 AGENT_LABEL = "com.tenon.ui"
 DEBOUNCE_MS = 500
 FALLBACK_MS = 60_000
+PACKAGE_DIR = Path(__file__).parent
 STATUS_TIMEOUT_MS = 10_000
 ICON_PX = 64
 COLORS = {
@@ -66,6 +68,16 @@ def apply_needs_terminal() -> bool:
     return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0
 
 
+def install_signature() -> tuple:
+    """Name, mtime and size of every installed source file; a reinstall rewrites them."""
+    return tuple((p.name, s.st_mtime_ns, s.st_size) for p in sorted(PACKAGE_DIR.glob("*.py")) for s in [p.stat()])
+
+
+def restart() -> None:
+    """Re-exec onto the new code; works with or without a supervisor."""
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 def quit_app() -> None:
     """Quit; on macOS also unload the KeepAlive agent so launchd does not relaunch us."""
     if sys.platform == "darwin":
@@ -100,6 +112,8 @@ class TrayApp:
         self.watcher.directoryChanged.connect(self.on_state_changed)
         self.watcher.fileChanged.connect(self.on_state_changed)
         self.watch_state()
+
+        self.installed = install_signature()
 
         self.refresh()
         self.fallback.start()
@@ -146,6 +160,9 @@ class TrayApp:
             self.tray.showMessage("tenon", view.last_run or view.headline,
                                   QSystemTrayIcon.MessageIcon.Critical if failed
                                   else QSystemTrayIcon.MessageIcon.Information)
+            if install_signature() != self.installed:
+                self.tray.hide()
+                restart()
 
     def on_menu_about_to_show(self) -> None:
         self.refresh()
