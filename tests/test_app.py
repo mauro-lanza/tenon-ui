@@ -83,6 +83,14 @@ def test_upgrade_needs_confirmation_then_password(monkeypatch):
     assert asked == [["upgrade", "--yes"]]
 
 
+class Process:
+    def __init__(self, err=""):
+        self.err = err.encode()
+
+    def readAllStandardError(self):
+        return self.err
+
+
 def test_wrong_password_offers_retry_once_per_user_choice(monkeypatch):
     qt = QApplication.instance() or QApplication([])
     tray = tray_app.TrayApp(qt)
@@ -90,13 +98,23 @@ def test_wrong_password_offers_retry_once_per_user_choice(monkeypatch):
     monkeypatch.setattr(tray, "run_with_password", lambda args: asked.append(args))
     retry, cancel = tray_app.QMessageBox.StandardButton.Retry, tray_app.QMessageBox.StandardButton.Cancel
     monkeypatch.setattr(tray_app.QMessageBox, "exec", lambda self: retry)
-    tray.on_privileged_finished(["upgrade", "--yes"], 0)
+    tray.on_privileged_finished(["upgrade", "--yes"], 0, Process())
     assert not asked
-    tray.on_privileged_finished(["upgrade", "--yes"], 65)
+    tray.on_privileged_finished(["upgrade", "--yes"], 65, Process())
     assert asked == [["upgrade", "--yes"]]
     monkeypatch.setattr(tray_app.QMessageBox, "exec", lambda self: cancel)
-    tray.on_privileged_finished(["upgrade", "--yes"], 65)
+    tray.on_privileged_finished(["upgrade", "--yes"], 65, Process())
     assert len(asked) == 1
+
+
+def test_privileged_failure_shows_stderr_tail(monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    tray = tray_app.TrayApp(qt)
+    shown = []
+    monkeypatch.setattr(tray_app.QMessageBox, "critical", staticmethod(lambda *a: shown.append(a[2])))
+    tray.on_privileged_finished(["apply"], 1, Process("a\nboom\n"))
+    tray.on_privileged_finished(["apply"], 2, Process(""))
+    assert "boom" in shown[0] and shown[1] == "tenon exited with 2"
 
 
 CAPS = ('{"capabilities":[{"id":"b","desc":"B tool","layer":"public","selected":false,"active":false},'

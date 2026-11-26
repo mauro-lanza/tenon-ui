@@ -456,14 +456,14 @@ class TrayApp:
         if password is None:
             return
         process = self.runner = QProcess()
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedChannels)
-        process.finished.connect(lambda code, _: self.on_privileged_finished(args, code))
+        process.setStandardOutputFile(QProcess.nullDevice())
+        process.finished.connect(lambda code, _: self.on_privileged_finished(args, code, process))
         process.start(str(CLI), [*args, "--password-stdin"])
         process.write(password.encode() + b"\n")
         process.closeWriteChannel()
         password = ""
 
-    def on_privileged_finished(self, args: list[str], code: int) -> None:
+    def on_privileged_finished(self, args: list[str], code: int, process: QProcess) -> None:
         outcome = password_outcome(code)
         if outcome == "retry":
             box = QMessageBox(QMessageBox.Icon.Warning, "tenon", "Incorrect password. Nothing was run.",
@@ -472,8 +472,9 @@ class TrayApp:
                 self.run_with_password(args)
         elif outcome == "busy":
             QMessageBox.information(None, "tenon", BUSY_MESSAGE)
-        elif outcome == "error":
-            QMessageBox.critical(None, "tenon", f"tenon rejected `{' '.join(args)}`.")
+        elif code != 0:
+            error = stderr_tail(bytes(process.readAllStandardError()).decode(errors="replace"))
+            QMessageBox.critical(None, "tenon", error or f"tenon exited with {code}")
 
     def show_log(self) -> None:
         if self.log_window is None:
