@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QHBoxLayout, QInputDialog, QLabel, 
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from tenon_ui.state import (BUSY_MESSAGE, CLI, LOG_DIR, STATE_DIR, UPDATE_MESSAGE, Capability, Health, Orphan, View,
-                            forget_args, latest_log, load_view, needs_force, needs_password, next_log_chunk,
+                            forget_args, latest_log, listed_capabilities, load_view, needs_force, needs_password, next_log_chunk,
                             orphan_count, parse_capabilities, parse_orphans, parse_report, parse_results,
                             password_outcome, remove_args, schema_too_new, selection_commands, stderr_tail)
 
@@ -202,6 +202,8 @@ class SettingsWindow(QWidget):
         self.tree = QTreeWidget(columnCount=4)
         self.tree.setHeaderLabels(["Capability", "Description", "Layer", ""])
         self.tree.setRootIsDecorated(False)
+        self.offerable: set[str] = set()
+        self.tree.itemChanged.connect(self.keep_unavailable_unticked)
         self.apply_button = QPushButton("Apply")
         self.apply_button.clicked.connect(self.save)
         note = QLabel("Deselecting a capability stops managing it; nothing is uninstalled.")
@@ -243,15 +245,30 @@ class SettingsWindow(QWidget):
     def show_capabilities(self, caps: list[Capability]) -> None:
         self.tree.clear()
         self.selected = {c.id for c in caps if c.selected}
-        for cap in caps:
-            item = QTreeWidgetItem([cap.id, cap.desc, cap.layer, "active" if cap.active else ""])
+        shown, hidden = listed_capabilities(caps)
+        self.offerable = {c.id for c in shown if c.offerable}
+        self.tree.blockSignals(True)
+        for cap in shown:
+            status = "active" if cap.active else ""
+            item = QTreeWidgetItem([cap.id, cap.desc, cap.layer, status if cap.offerable else "Not available on this system"])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            if not cap.offerable:
+                item.setForeground(0, self.palette().placeholderText())
+                for column in range(1, 4):
+                    item.setForeground(column, self.palette().placeholderText())
             item.setCheckState(0, Qt.CheckState.Checked if cap.selected else Qt.CheckState.Unchecked)
             self.tree.addTopLevelItem(item)
+        self.tree.blockSignals(False)
         for column in range(4):
             self.tree.resizeColumnToContents(column)
-        self.status.setText(f"{len(caps)} capabilities")
+        self.status.setText(f"{len(shown)} capabilities" + (f", {hidden} for other systems hidden" if hidden else ""))
         self.apply_filter(self.filter.text())
+
+    def keep_unavailable_unticked(self, item: QTreeWidgetItem) -> None:
+        if item.text(0) not in self.offerable and item.checkState(0) is Qt.CheckState.Checked:
+            self.tree.blockSignals(True)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            self.tree.blockSignals(False)
 
     def apply_filter(self, text: str) -> None:
         needle = text.lower()
@@ -264,7 +281,7 @@ class SettingsWindow(QWidget):
         return {item.text(0) for item in items if item.checkState(0) is Qt.CheckState.Checked}
 
     def save(self) -> None:
-        self.queue = selection_commands(self.selected, self.wanted())
+        self.queue = selection_commands(self.selected, self.wanted(), self.offerable)
         self.apply_button.setEnabled(False)
         self.run_next()
 

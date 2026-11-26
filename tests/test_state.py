@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from tenon_ui.state import (Health, build_view, next_log_chunk, parse_capabilities, parse_report, password_outcome,
+from tenon_ui.state import (Health, build_view, listed_capabilities, next_log_chunk, parse_capabilities, parse_report, password_outcome,
                             read_jsonl, schedule_line, selection_commands)
 
 
@@ -9,11 +9,23 @@ def test_schedule_line_password_outcome_and_selection_diff():
     assert schedule_line({"schedule": {"upgrade": "11:00", "check": "12:00"}}) == "Next: upgrade 11:00 \u00b7 check 12:00"
     assert schedule_line({"schedule": None}) == schedule_line(None) == ""
     assert [password_outcome(c) for c in (0, 1, 64, 65)] == ["done", "done", "error", "retry"]
-    assert selection_commands({"a", "b"}, {"a", "b"}) == []
-    assert selection_commands({"a"}, {"c", "b"}) == [["capabilities", "select", "b", "c"],
-                                                     ["capabilities", "deselect", "a"]]
+    assert selection_commands({"a", "b"}, {"a", "b"}, {"a", "b"}) == []
+    assert selection_commands({"a"}, {"c", "b"}, {"a", "b", "c"}) == [["capabilities", "select", "b", "c"],
+                                                                      ["capabilities", "deselect", "a"]]
     assert parse_capabilities("nope") is None
     assert parse_capabilities('{"capabilities":[{"id":"x"}]}') is None
+
+
+def test_offerable_parsing_listing_and_selection_guard():
+    rows = ('{"capabilities":[{"id":"old","selected":true,"active":false},'
+            '{"id":"mac","selected":true,"active":false,"offerable":false},'
+            '{"id":"gone","selected":false,"active":false,"offerable":false}]}')
+    caps = parse_capabilities(rows)
+    assert {c.id: c.offerable for c in caps} == {"old": True, "mac": False, "gone": False}
+    shown, hidden = listed_capabilities(caps)
+    assert sorted(c.id for c in shown) == ["mac", "old"] and hidden == 1
+    assert selection_commands({"mac"}, {"mac", "gone"}, {"old"}) == []
+    assert selection_commands({"mac"}, set(), {"old"}) == [["capabilities", "deselect", "mac"]]
 
 
 def test_log_chunk_growth_partial_line_replacement_and_empty(tmp_path):

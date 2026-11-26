@@ -126,11 +126,25 @@ def test_settings_window_lists_filters_and_diffs_the_selection():
     assert window.tree.topLevelItem(0).text(3) == "active"
     window.tree.topLevelItem(1).setCheckState(0, tray_app.Qt.CheckState.Checked)
     window.tree.topLevelItem(0).setCheckState(0, tray_app.Qt.CheckState.Unchecked)
-    assert tray_app.selection_commands(window.selected, window.wanted()) == [
+    assert tray_app.selection_commands(window.selected, window.wanted(), window.offerable) == [
         ["capabilities", "select", "b"], ["capabilities", "deselect", "a"]]
     window.filter.setText("A tool")
     assert not window.tree.topLevelItem(0).isHidden() and window.tree.topLevelItem(1).isHidden()
     qt.processEvents()
+
+
+def test_settings_window_greys_selected_unavailable_and_blocks_reticking():
+    QApplication.instance() or QApplication([])
+    window = tray_app.SettingsWindow(lambda: None)
+    window.show_capabilities(tray_app.parse_capabilities(
+        '{"capabilities":[{"id":"m","layer":"p","selected":true,"active":false,"offerable":false},'
+        '{"id":"h","layer":"p","selected":false,"active":false,"offerable":false}]}'))
+    assert window.tree.topLevelItemCount() == 1 and "1 for other systems hidden" in window.status.text()
+    item = window.tree.topLevelItem(0)
+    assert item.text(3) == "Not available on this system"
+    item.setCheckState(0, tray_app.Qt.CheckState.Unchecked)
+    item.setCheckState(0, tray_app.Qt.CheckState.Checked)
+    assert item.checkState(0) is tray_app.Qt.CheckState.Unchecked
 
 
 def test_menu_shows_schedule_and_capabilities(monkeypatch):

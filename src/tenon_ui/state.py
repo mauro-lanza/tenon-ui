@@ -58,6 +58,7 @@ class Capability:
     layer: str
     selected: bool
     active: bool
+    offerable: bool = True
 
 
 EXIT_USAGE = 64
@@ -94,18 +95,26 @@ def parse_capabilities(text: str) -> list[Capability] | None:
         if schema_too_new(data):
             return None
         rows = data["capabilities"]
-        caps = [Capability(r["id"], r.get("desc") or "", r.get("layer") or "", bool(r["selected"]), bool(r["active"]))
+        caps = [Capability(r["id"], r.get("desc") or "", r.get("layer") or "", bool(r["selected"]), bool(r["active"]),
+                        bool(r.get("offerable", True)))
                 for r in rows]
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
     return sorted(caps, key=lambda c: (c.layer, c.id))
 
 
-def selection_commands(selected: set[str], wanted: set[str]) -> list[list[str]]:
-    """`tenon capabilities` argument lists that turn the `selected` set into `wanted`."""
+def listed_capabilities(caps: list[Capability]) -> tuple[list[Capability], int]:
+    """Capabilities to show (offerable or already selected) and how many others are hidden."""
+    shown = [c for c in caps if c.offerable or c.selected]
+    return shown, len(caps) - len(shown)
+
+
+def selection_commands(selected: set[str], wanted: set[str], offerable: set[str]) -> list[list[str]]:
+    """`tenon capabilities` argument lists that turn the `selected` set into `wanted`; never selects a non-offerable id."""
     commands = []
-    if wanted - selected:
-        commands.append(["capabilities", "select", *sorted(wanted - selected)])
+    to_select = (wanted - selected) & offerable
+    if to_select:
+        commands.append(["capabilities", "select", *sorted(to_select)])
     if selected - wanted:
         commands.append(["capabilities", "deselect", *sorted(selected - wanted)])
     return commands
