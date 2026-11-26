@@ -139,4 +139,33 @@ def test_restart_re_execs_the_interpreter_with_the_same_argv(monkeypatch):
 def test_icons_render_for_every_health():
     QApplication.instance() or QApplication([])
     for health in Health:
-        assert not tray_app.make_icon(health, 42).isNull()
+        spec = tray_app.icon_spec(health, True, False)
+        assert not tray_app.make_icon(health, 42, spec, 2.0).isNull()
+
+
+def test_icon_spec_is_template_on_macos_and_follows_the_scheme_on_linux():
+    for health in Health:
+        mac = tray_app.icon_spec(health, True, False)
+        assert mac.mask == (health is not Health.FAILED)
+        assert not tray_app.icon_spec(health, False, True).mask
+    assert tray_app.icon_spec(Health.FAILED, True, True).color == tray_app.FAILED_COLOR
+    assert tray_app.icon_spec(Health.OK, False, True).color == "#fcfcfc"
+    assert tray_app.icon_spec(Health.OK, False, False).color == "#232629"
+
+
+def test_log_window_streams_appends_and_switches_to_a_new_run(tmp_path, monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(tray_app, "LOG_DIR", tmp_path)
+    (tmp_path / "20260101-000000-apply.log").write_text("one\n")
+    window = tray_app.LogWindow()
+    window.refresh()
+    assert window.toPlainText() == "one\n"
+    with (tmp_path / "20260101-000000-apply.log").open("a") as f:
+        f.write("two\n")
+    window.refresh()
+    assert window.toPlainText() == "one\ntwo\n"
+    (tmp_path / "20260102-000000-check.log").write_text("new\n")
+    window.refresh()
+    assert window.toPlainText() == "new\n"
+    qt.processEvents()
+

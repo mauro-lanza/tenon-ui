@@ -1,7 +1,23 @@
 import json
 from pathlib import Path
 
-from tenon_ui.state import Health, build_view, parse_report, read_jsonl
+from tenon_ui.state import Health, build_view, next_log_chunk, parse_report, read_jsonl
+
+
+def test_log_chunk_growth_partial_line_replacement_and_empty(tmp_path):
+    assert next_log_chunk(tmp_path, None, 0) == (None, 0, "", False)
+    first = tmp_path / "20260101-000000-apply.log"
+    first.write_text("a\nb")
+    log, offset, text, replaced = next_log_chunk(tmp_path, None, 0)
+    assert (log, offset, text, replaced) == (first, 2, "a\n", True)
+    first.write_text("a\nb\nc\n")
+    assert next_log_chunk(tmp_path, first, offset) == (first, 6, "b\nc\n", False)
+    assert next_log_chunk(tmp_path, first, 6) == (first, 6, "", False)
+    second = tmp_path / "20260102-000000-check.log"
+    second.write_text("x\n")
+    assert next_log_chunk(tmp_path, first, 6) == (second, 2, "x\n", True)
+    second.write_text("")
+    assert next_log_chunk(tmp_path, second, 2) == (second, 0, "", True)
 
 
 def run(mode="apply", result="ok", changed=(), failed=(), **extra):

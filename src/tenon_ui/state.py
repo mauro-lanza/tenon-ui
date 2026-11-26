@@ -4,6 +4,7 @@ No Qt here, so it runs and tests without a display.
 """
 
 import json
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -11,6 +12,7 @@ from pathlib import Path
 
 STATE_DIR = Path.home() / ".local/state/tenon"
 CLI = Path.home() / ".local/bin/tenon"
+LOG_DIR = Path.home() / ("Library/Logs/tenon" if sys.platform == "darwin" else ".local/state/tenon/logs")
 # Past this with no new progress line, a run without an end marker was killed.
 STALLED_SECONDS = 300
 LISTED_FAILED = 6
@@ -169,6 +171,33 @@ def build_view(report: dict | None, progress: list[dict], progress_age: float | 
                 changed[:LISTED_CHANGED], sync, managed, _existing_log(history),
                 bool((status or {}).get("partial")), max(0, len(changed) - LISTED_CHANGED),
                 runs, orphans[:LISTED_ORPHANS])
+
+
+def latest_log(log_dir: Path) -> Path | None:
+    """The newest run log: names start with a timestamp, so the last name is the current or most recent run."""
+    return max(log_dir.glob("*.log"), default=None, key=lambda p: p.name)
+
+
+def next_log_chunk(log_dir: Path, shown: Path | None, offset: int) -> tuple[Path | None, int, str, bool]:
+    """Returns (log, new offset, new text, replaced) for the window showing `shown` up to `offset`.
+
+    `replaced` means a newer run's log took over (or the file shrank): the caller clears first.
+    Only whole lines are returned; a partial last line waits for its newline.
+    """
+    log = latest_log(log_dir)
+    if log is None:
+        return None, 0, "", shown is not None
+    try:
+        size = log.stat().st_size
+        replaced = log != shown or size < offset
+        start = 0 if replaced else offset
+        with log.open("rb") as f:
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return shown, offset, "", False
+    complete = data[: data.rfind(b"\n") + 1]
+    return log, start + len(complete), complete.decode(errors="replace"), replaced
 
 
 def load_view(report: dict | None, state_dir: Path = STATE_DIR) -> View:
