@@ -1,7 +1,19 @@
 import json
 from pathlib import Path
 
-from tenon_ui.state import Health, build_view, next_log_chunk, parse_report, read_jsonl
+from tenon_ui.state import (Health, build_view, next_log_chunk, parse_capabilities, parse_report, password_outcome,
+                            read_jsonl, schedule_line, selection_commands)
+
+
+def test_schedule_line_password_outcome_and_selection_diff():
+    assert schedule_line({"schedule": {"upgrade": "11:00", "check": "12:00"}}) == "Next: upgrade 11:00 \u00b7 check 12:00"
+    assert schedule_line({"schedule": None}) == schedule_line(None) == ""
+    assert [password_outcome(c) for c in (0, 1, 64, 65)] == ["done", "done", "error", "retry"]
+    assert selection_commands({"a", "b"}, {"a", "b"}) == []
+    assert selection_commands({"a"}, {"c", "b"}) == [["capabilities", "select", "b", "c"],
+                                                     ["capabilities", "deselect", "a"]]
+    assert parse_capabilities("nope") is None
+    assert parse_capabilities('{"capabilities":[{"id":"x"}]}') is None
 
 
 def test_log_chunk_growth_partial_line_replacement_and_empty(tmp_path):

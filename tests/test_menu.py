@@ -15,7 +15,6 @@ def test_menu_has_upgrade_recent_runs_orphans_and_partial_note(monkeypatch):
     tray = tray_app.TrayApp(qt)
     monkeypatch.setattr(tray, "refresh", lambda: None)
     monkeypatch.setattr(tray_app.sys, "platform", "darwin")
-    monkeypatch.setattr(tray_app, "apply_needs_terminal", lambda: False)
     report = {"last_run": {"mode": "apply", "result": "ok", "partial": True}}
     history = [{"finished": "2026-11-25T09:00:00", "result": "ok"}]
     tray.view = build_view(report, [], None, history, {"orphans": [{"path": "/old"}]})

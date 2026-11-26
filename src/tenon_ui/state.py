@@ -45,6 +45,53 @@ class View:
     changed_more: int
     runs: tuple["RunRow", ...]
     orphans: tuple[str, ...]
+    schedule: str
+
+
+@dataclass(frozen=True)
+class Capability:
+    id: str
+    desc: str
+    layer: str
+    selected: bool
+    active: bool
+
+
+EXIT_USAGE = 64
+EXIT_BAD_PASSWORD = 65
+
+
+def schedule_line(report: dict | None) -> str:
+    schedule = (report or {}).get("schedule")
+    if not schedule:
+        return ""
+    return "Next: " + " \u00b7 ".join(f"{name} {schedule[name]}" for name in ("upgrade", "check") if schedule.get(name))
+
+
+def password_outcome(code: int) -> str:
+    """What a privileged run's exit code asks of the UI: 'retry' (wrong password), 'error' (bad usage) or 'done'."""
+    return {EXIT_BAD_PASSWORD: "retry", EXIT_USAGE: "error"}.get(code, "done")
+
+
+def parse_capabilities(text: str) -> list[Capability] | None:
+    """Parses `tenon capabilities --json`, sorted by layer then id; None when it is not that."""
+    try:
+        rows = json.loads(text)["capabilities"]
+        caps = [Capability(r["id"], r.get("desc") or "", r.get("layer") or "", bool(r["selected"]), bool(r["active"]))
+                for r in rows]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    return sorted(caps, key=lambda c: (c.layer, c.id))
+
+
+def selection_commands(selected: set[str], wanted: set[str]) -> list[list[str]]:
+    """`tenon capabilities` argument lists that turn the `selected` set into `wanted`."""
+    commands = []
+    if wanted - selected:
+        commands.append(["capabilities", "select", *sorted(wanted - selected)])
+    if selected - wanted:
+        commands.append(["capabilities", "deselect", *sorted(selected - wanted)])
+    return commands
 
 
 @dataclass(frozen=True)
@@ -170,7 +217,7 @@ def build_view(report: dict | None, progress: list[dict], progress_age: float | 
     return View(health, percent, headline, detail, last_run, failed[:LISTED_FAILED],
                 changed[:LISTED_CHANGED], sync, managed, _existing_log(history),
                 bool((status or {}).get("partial")), max(0, len(changed) - LISTED_CHANGED),
-                runs, orphans[:LISTED_ORPHANS])
+                runs, orphans[:LISTED_ORPHANS], schedule_line(report))
 
 
 def latest_log(log_dir: Path) -> Path | None:

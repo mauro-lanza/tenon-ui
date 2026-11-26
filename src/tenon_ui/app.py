@@ -11,9 +11,12 @@ from pathlib import Path
 from PySide6.QtCore import QFileSystemWatcher, QPointF, QProcess, QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon,
                            QPainter, QPainterPath, QPen, QPixmap, QTextCursor)
-from PySide6.QtWidgets import QApplication, QMenu, QPlainTextEdit, QSystemTrayIcon
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
+                               QPlainTextEdit, QPushButton, QSystemTrayIcon, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
-from tenon_ui.state import CLI, LOG_DIR, STATE_DIR, Health, View, latest_log, load_view, next_log_chunk, parse_report
+from tenon_ui.state import (CLI, LOG_DIR, STATE_DIR, Capability, Health, View, latest_log, load_view, next_log_chunk,
+                            parse_capabilities, parse_report, password_outcome, selection_commands)
 
 AGENT_LABEL = "com.tenon.ui"
 LOG_MAX_LINES = 20_000
@@ -21,7 +24,8 @@ DEBOUNCE_MS = 500
 FALLBACK_MS = 60_000
 PACKAGE_DIR = Path(__file__).parent
 STATUS_TIMEOUT_MS = 10_000
-UPGRADE_COMMAND = Path.home() / ".local/share/tenon/actions/upgrade.command"
+UPGRADE_WARNING = ("Upgrade packages with Homebrew. Casks may quit and replace running apps, "
+                   "and some steps need your admin password.")
 ICON_SIZE = 22
 FAILED_COLOR = "#e5484d"
 GLYPHS = {Health.UNKNOWN: "?", Health.FAILED: "!", Health.DRIFT: "~", Health.STALE: "z"}
@@ -124,11 +128,7 @@ class LogWindow(QPlainTextEdit):
 
     def present(self) -> None:
         self.refresh()
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        if sys.platform == "darwin":
-            activate_app()
+        activate_window(self)
 
     def refresh(self) -> None:
         # Watches drop when a file is replaced or a directory is created late, so re-add each time.
@@ -155,11 +155,122 @@ def open_file(path: Path) -> None:
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
-def apply_needs_terminal() -> bool:
-    """True where a detached `tenon apply` would silently skip its root steps (Linux without passwordless sudo)."""
+def sudo_is_passwordless() -> bool:
+    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0
+
+
+def ask_password() -> str | None:
+    """None when cancelled; an empty string means skip the steps that need root."""
+    text, ok = QInputDialog.getText(None, "tenon", "Admin password (leave empty to skip steps that need it):",
+                                    QLineEdit.EchoMode.Password)
+    return text if ok else None
+
+
+def activate_window(window: QWidget) -> None:
+    window.show()
+    window.raise_()
+    window.activateWindow()
     if sys.platform == "darwin":
-        return False
-    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0
+        activate_app()
+
+
+class SettingsWindow(QWidget):
+    """Checkbox per capability; Apply writes the selection diff through the CLI, then offers a run."""
+
+    def __init__(self, apply_now) -> None:
+        super().__init__()
+        self.apply_now = apply_now
+        self.setWindowTitle("tenon capabilities")
+        self.resize(760, 560)
+        self.selected: set[str] = set()
+        self.queue: list[list[str]] = []
+        self.process: QProcess | None = None
+
+        self.filter = QLineEdit(placeholderText="Filter")
+        self.filter.textChanged.connect(self.apply_filter)
+        self.tree = QTreeWidget(columnCount=4)
+        self.tree.setHeaderLabels(["Capability", "Description", "Layer", ""])
+        self.tree.setRootIsDecorated(False)
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.clicked.connect(self.save)
+        note = QLabel("Deselecting a capability stops managing it; nothing is uninstalled.")
+        self.status = QLabel("Loading\u2026")
+        bottom = QHBoxLayout()
+        bottom.addWidget(note, 1)
+        bottom.addWidget(self.apply_button)
+        layout = QVBoxLayout(self)
+        for part in (self.filter, self.tree, self.status):
+            layout.addWidget(part)
+        layout.addLayout(bottom)
+
+    def present(self) -> None:
+        self.load()
+        activate_window(self)
+
+    def load(self) -> None:
+        process = QProcess(self)
+        process.finished.connect(lambda code, _: self.on_loaded(code, process))
+        process.errorOccurred.connect(lambda error: error is QProcess.ProcessError.FailedToStart
+                                      and self.status.setText("tenon is not installed"))
+        process.start(str(CLI), ["capabilities", "--json"])
+
+    def on_loaded(self, code: int, process: QProcess) -> None:
+        text = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        caps = parse_capabilities(text) if code == 0 else None
+        if caps is None:
+            self.status.setText("Could not read capabilities")
+            return
+        self.show_capabilities(caps)
+
+    def show_capabilities(self, caps: list[Capability]) -> None:
+        self.tree.clear()
+        self.selected = {c.id for c in caps if c.selected}
+        for cap in caps:
+            item = QTreeWidgetItem([cap.id, cap.desc, cap.layer, "active" if cap.active else ""])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Checked if cap.selected else Qt.CheckState.Unchecked)
+            self.tree.addTopLevelItem(item)
+        for column in range(4):
+            self.tree.resizeColumnToContents(column)
+        self.status.setText(f"{len(caps)} capabilities")
+        self.apply_filter(self.filter.text())
+
+    def apply_filter(self, text: str) -> None:
+        needle = text.lower()
+        for row in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(row)
+            item.setHidden(bool(needle) and not any(needle in item.text(c).lower() for c in range(3)))
+
+    def wanted(self) -> set[str]:
+        items = (self.tree.topLevelItem(row) for row in range(self.tree.topLevelItemCount()))
+        return {item.text(0) for item in items if item.checkState(0) is Qt.CheckState.Checked}
+
+    def save(self) -> None:
+        self.queue = selection_commands(self.selected, self.wanted())
+        self.apply_button.setEnabled(False)
+        self.run_next()
+
+    def run_next(self) -> None:
+        if not self.queue:
+            self.apply_button.setEnabled(True)
+            self.load()
+            answer = QMessageBox.question(self, "tenon", "Selection saved. Apply now?")
+            if answer == QMessageBox.StandardButton.Yes:
+                self.apply_now()
+            return
+        process = self.process = QProcess(self)
+        process.finished.connect(lambda code, _: self.on_command_finished(code, process))
+        process.start(str(CLI), self.queue.pop(0))
+
+    def on_command_finished(self, code: int, process: QProcess) -> None:
+        if code != 0:
+            error = bytes(process.readAllStandardError()).decode(errors="replace").strip()
+            QMessageBox.critical(self, "tenon", error or f"tenon exited with {code}")
+            self.queue.clear()
+            self.apply_button.setEnabled(True)
+            self.load()
+            return
+        self.run_next()
 
 
 def install_signature() -> tuple:
@@ -192,6 +303,8 @@ class TrayApp:
         self.view: View | None = None
         self.health, self.percent = Health.UNKNOWN, None
         self.log_window: LogWindow | None = None
+        self.settings_window: SettingsWindow | None = None
+        self.runner: QProcess | None = None
         self.tray = QSystemTrayIcon()
         self.update_icon()
         QGuiApplication.styleHints().colorSchemeChanged.connect(self.update_icon)
@@ -239,6 +352,50 @@ class TrayApp:
         ratio = max(2.0, QGuiApplication.primaryScreen().devicePixelRatio())
         spec = icon_spec(self.health, sys.platform == "darwin", dark)
         self.tray.setIcon(make_icon(self.health, self.percent, spec, ratio))
+
+    def show_settings(self) -> None:
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self.start_apply)
+        self.settings_window.present()
+
+    def start_apply(self) -> None:
+        """macOS applies need no password; Linux asks for one unless sudo is passwordless."""
+        if sys.platform == "darwin" or sudo_is_passwordless():
+            QProcess.startDetached(str(CLI), ["apply"])
+        else:
+            self.run_with_password(["apply"])
+
+    def start_upgrade(self) -> None:
+        answer = QMessageBox.question(None, "Upgrade packages", UPGRADE_WARNING + "\n\nContinue?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if sudo_is_passwordless():
+            QProcess.startDetached(str(CLI), ["upgrade", "--yes"])
+        else:
+            self.run_with_password(["upgrade", "--yes"])
+
+    def run_with_password(self, args: list[str]) -> None:
+        """Feeds the password to the CLI on stdin only; progress shows through the state files."""
+        password = ask_password()
+        if password is None:
+            return
+        process = self.runner = QProcess()
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedChannels)
+        process.finished.connect(lambda code, _: self.on_privileged_finished(args, code))
+        process.start(str(CLI), [*args, "--password-stdin"])
+        process.write(password.encode() + b"\n")
+        process.closeWriteChannel()
+        password = ""
+
+    def on_privileged_finished(self, args: list[str], code: int) -> None:
+        outcome = password_outcome(code)
+        if outcome == "retry":
+            box = QMessageBox(QMessageBox.Icon.Warning, "tenon", "Incorrect password. Nothing was run.",
+                              QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel)
+            if box.exec() == QMessageBox.StandardButton.Retry:
+                self.run_with_password(args)
+        elif outcome == "error":
+            QMessageBox.critical(None, "tenon", f"tenon rejected `{' '.join(args)}`.")
 
     def show_log(self) -> None:
         if self.log_window is None:
@@ -314,6 +471,7 @@ class TrayApp:
             label(f"  \u2026 and {view.changed_more} more")
         label(view.sync)
         label(view.managed)
+        label(view.schedule)
         if view.orphans:
             orphans = menu.addMenu("No longer managed, still on disk")
             for path in view.orphans:
@@ -323,15 +481,18 @@ class TrayApp:
         menu.addSeparator()
         idle = view.health is not Health.RUNNING
         self.add_run(menu, "Check for drift", ["check"], idle)
-        if apply_needs_terminal():
-            menu.addAction("Apply now: run `tenon apply` in a terminal").setEnabled(False)
-        else:
-            self.add_run(menu, "Apply now", ["apply"], idle)
+        apply = QAction("Apply now", menu)
+        apply.setEnabled(idle)
+        apply.triggered.connect(self.start_apply)
+        menu.addAction(apply)
         if sys.platform == "darwin":
             upgrade = QAction("Upgrade packages\u2026", menu)
             upgrade.setEnabled(idle)
-            upgrade.triggered.connect(lambda: QProcess.startDetached("/usr/bin/open", [str(UPGRADE_COMMAND)]))
+            upgrade.triggered.connect(self.start_upgrade)
             menu.addAction(upgrade)
+        settings = QAction("Capabilities\u2026", menu)
+        settings.triggered.connect(self.show_settings)
+        menu.addAction(settings)
         if latest_log(LOG_DIR):
             show_log = QAction("Show log", menu)
             show_log.triggered.connect(self.show_log)

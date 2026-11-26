@@ -2,6 +2,8 @@
 
 Tray/menu-bar app for [tenon](../tenon). It shows run state (running with %, ok, failed, drift, stale), notifies when a run finishes, and starts `tenon check` / `tenon apply`. It only uses the `tenon` CLI and the state files in `~/.local/state/tenon`.
 
+It also shows the next scheduled run, streams the run log, opens a capabilities window (`tenon capabilities`), and runs "Upgrade packages" (macOS) and, on Linux, "Apply now" without a terminal: when `sudo -n` fails it asks for the admin password and pipes it to `tenon … --password-stdin`. The password is never stored or logged; a wrong one (exit 65) offers a retry.
+
 Targets macOS 13+ (Apple Silicon) and KDE Plasma 6 on Wayland. Python 3.13+.
 
 ## Install and run
@@ -22,8 +24,8 @@ Tests need no display (`QT_QPA_PLATFORM=offscreen` is set by the smoke test).
 
 ## Layout
 
-- `src/tenon_ui/state.py`: reads the CLI and state files into a `View` (no Qt).
-- `src/tenon_ui/app.py`: tray icon, file watcher, menu, notifications.
+- `src/tenon_ui/state.py`: reads the CLI and state files into a `View`, plus pure helpers for capabilities, schedule and password outcomes (no Qt).
+- `src/tenon_ui/app.py`: tray icon, file watcher, menu, notifications, log and capabilities windows, password flow.
 
 ## Limits
 
