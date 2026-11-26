@@ -54,7 +54,7 @@ def test_start_apply_asks_for_a_password_only_on_linux_without_passwordless_sudo
     qt = QApplication.instance() or QApplication([])
     tray = tray_app.TrayApp(qt)
     detached, asked = [], []
-    monkeypatch.setattr(tray_app.QProcess, "startDetached", staticmethod(lambda *a: detached.append(a)))
+    monkeypatch.setattr(tray, "start_run", lambda args: detached.append(args))
     monkeypatch.setattr(tray, "run_with_password", lambda args: asked.append(args))
     monkeypatch.setattr(tray_app, "sudo_is_passwordless", lambda: False)
     monkeypatch.setattr(tray_app.sys, "platform", "darwin")
@@ -223,4 +223,95 @@ def test_log_window_streams_appends_and_switches_to_a_new_run(tmp_path, monkeypa
     window.refresh()
     assert window.toPlainText() == "new\n"
     qt.processEvents()
+
+
+def running_report(**fields):
+    return {"schema_version": 1, "current_run": {"mode": "apply", "phase": "running", "total": 10, "n": 2, **fields}}
+
+
+def test_poll_timer_runs_only_while_a_run_is_in_progress(monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    tray = tray_app.TrayApp(qt)
+    monkeypatch.setattr(tray, "refresh", lambda: None)
+    tray.apply_report(running_report())
+    assert tray.poll.isActive() and tray.health is Health.RUNNING
+    tray.apply_report(running_report(phase="stalled"))
+    assert tray.poll.isActive() and tray.health is Health.STALLED
+    tray.apply_report({"schema_version": 1, "current_run": None})
+    assert not tray.poll.isActive()
+
+
+def test_run_finished_notifies_from_running_or_stalled(monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    tray = tray_app.TrayApp(qt)
+    monkeypatch.setattr(tray, "refresh", lambda: None)
+    messages = []
+    monkeypatch.setattr(tray.tray, "showMessage", lambda *a: messages.append(a))
+    for phase in ("running", "stalled"):
+        tray.apply_report(running_report(phase=phase))
+        tray.apply_report({"schema_version": 1, "current_run": None})
+    assert len(messages) == 2
+
+
+def test_poll_tick_spins_indeterminate_and_asks_status_every_few_ticks(monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    tray = tray_app.TrayApp(qt)
+    calls = []
+    monkeypatch.setattr(tray, "refresh", lambda: calls.append(1))
+    tray.apply_report(running_report(phase="launching"))
+    for _ in range(tray_app.STATUS_EVERY_TICKS):
+        tray.on_poll()
+    assert tray.spin == tray_app.SPIN_DEGREES * tray_app.STATUS_EVERY_TICKS and calls == [1]
+    tray.apply_report({"current_run": None})
+
+
+def test_exit_75_says_a_run_is_in_progress_and_other_codes_show_stderr(monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    tray = tray_app.TrayApp(qt)
+    monkeypatch.setattr(tray, "refresh", lambda: None)
+    shown = []
+    monkeypatch.setattr(tray_app.QMessageBox, "information", staticmethod(lambda *a: shown.append(a[2])))
+    monkeypatch.setattr(tray_app.QMessageBox, "critical", staticmethod(lambda *a: shown.append(a[2])))
+
+    class Process:
+        def readAllStandardError(self):
+            return b"a\nb\nboom"
+
+    tray.on_run_finished(0, Process())
+    tray.on_run_finished(75, Process())
+    tray.on_run_finished(1, Process())
+    assert shown == ["A run is already in progress", "a\nb\nboom"]
+
+
+def test_quit_asks_only_while_our_run_is_active(monkeypatch):
+    qt = QApplication.instance() or QApplication([])
+    tray = tray_app.TrayApp(qt)
+    quits, answers = [], []
+    monkeypatch.setattr(tray_app, "quit_app", lambda: quits.append(1))
+    monkeypatch.setattr(tray_app.QMessageBox, "question", staticmethod(lambda *a: answers.pop(0)))
+
+    class Runner:
+        def state(self):
+            return tray_app.QProcess.ProcessState.Running
+
+    tray.request_quit()
+    assert quits == [1]
+    tray.runner = Runner()
+    answers[:] = [tray_app.QMessageBox.StandardButton.No, tray_app.QMessageBox.StandardButton.Yes]
+    tray.request_quit()
+    assert quits == [1]
+    tray.request_quit()
+    assert quits == [1, 1]
+
+
+def test_log_window_follows_the_current_run_log(tmp_path, monkeypatch):
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(tray_app, "LOG_DIR", tmp_path)
+    (tmp_path / "20260102-000000-check.log").write_text("newest\n")
+    running = tmp_path / "20260101-000000-apply.log"
+    running.write_text("mine\n")
+    window = tray_app.LogWindow()
+    window.current = running
+    window.refresh()
+    assert window.toPlainText() == "mine\n"
 

@@ -2,6 +2,7 @@
 
 import ctypes
 import ctypes.util
+import json
 import os
 import subprocess
 import sys
@@ -15,20 +16,26 @@ from PySide6.QtWidgets import (QApplication, QHBoxLayout, QInputDialog, QLabel, 
                                QPlainTextEdit, QPushButton, QSystemTrayIcon, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
-from tenon_ui.state import (CLI, LOG_DIR, STATE_DIR, Capability, Health, View, latest_log, load_view, next_log_chunk,
-                            parse_capabilities, parse_report, password_outcome, selection_commands)
+from tenon_ui.state import (BUSY_MESSAGE, CLI, LOG_DIR, STATE_DIR, UPDATE_MESSAGE, Capability, Health, View, latest_log,
+                            load_view, next_log_chunk, parse_capabilities, parse_report, password_outcome,
+                            schema_too_new, selection_commands, stderr_tail)
 
 AGENT_LABEL = "com.tenon.ui"
 LOG_MAX_LINES = 20_000
 DEBOUNCE_MS = 500
 FALLBACK_MS = 60_000
+# macOS QFileSystemWatcher misses appends, so a run is followed by polling the files; status (~80 ms spawn) only every few ticks.
+POLL_MS = 1_000
+STATUS_EVERY_TICKS = 3
+SPIN_DEGREES = 30
 PACKAGE_DIR = Path(__file__).parent
 STATUS_TIMEOUT_MS = 10_000
 UPGRADE_WARNING = ("Upgrade packages with Homebrew. Casks may quit and replace running apps, "
                    "and some steps need your admin password.")
 ICON_SIZE = 22
 FAILED_COLOR = "#e5484d"
-GLYPHS = {Health.UNKNOWN: "?", Health.FAILED: "!", Health.DRIFT: "~", Health.STALE: "z"}
+RUN_HEALTH = (Health.RUNNING, Health.STALLED)
+GLYPHS = {Health.UNKNOWN: "?", Health.FAILED: "!", Health.DRIFT: "~", Health.STALE: "z", Health.STALLED: "\u2026"}
 
 
 @dataclass(frozen=True)
@@ -46,8 +53,10 @@ def icon_spec(health: Health, mac: bool, dark: bool) -> IconSpec:
     return IconSpec("#fcfcfc" if dark else "#232629", False)
 
 
-def make_icon(health: Health, percent: int | None, spec: IconSpec, ratio: float) -> QIcon:
-    """State is encoded by shape (ring + check / progress arc / filled '!' / glyphs), not by colour."""
+def make_icon(health: Health, percent: int | None, spec: IconSpec, ratio: float, spin: int = 0) -> QIcon:
+    """State is encoded by shape (ring + check / progress arc / filled '!' / glyphs), not by colour.
+
+    Without a percent the arc is a quarter that `spin` rotates."""
     pixmap = QPixmap(round(ICON_SIZE * ratio), round(ICON_SIZE * ratio))
     pixmap.setDevicePixelRatio(ratio)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -69,7 +78,7 @@ def make_icon(health: Health, percent: int | None, spec: IconSpec, ratio: float)
         painter.drawEllipse(ring)
         painter.setPen(pen)
         sweep = 360 * (percent if percent is not None else 25) // 100
-        painter.drawArc(ring, 90 * 16, -sweep * 16)
+        painter.drawArc(ring, (90 - spin) * 16, -sweep * 16)
     else:
         painter.drawEllipse(ring)
     if health is Health.OK:
@@ -121,6 +130,7 @@ class LogWindow(QPlainTextEdit):
         self.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.resize(900, 600)
         self.log: Path | None = None
+        self.current: Path | None = None
         self.offset = 0
         self.watcher = QFileSystemWatcher()
         self.watcher.directoryChanged.connect(self.refresh)
@@ -136,7 +146,7 @@ class LogWindow(QPlainTextEdit):
         missing = [p for p in wanted if p not in self.watcher.files() + self.watcher.directories()]
         if missing:
             self.watcher.addPaths(missing)
-        self.log, self.offset, text, replaced = next_log_chunk(LOG_DIR, self.log, self.offset)
+        self.log, self.offset, text, replaced = next_log_chunk(LOG_DIR, self.log, self.offset, self.current)
         self.setWindowTitle(f"tenon log: {self.log.name}" if self.log else "tenon log")
         if replaced:
             self.clear()
@@ -216,7 +226,14 @@ class SettingsWindow(QWidget):
 
     def on_loaded(self, code: int, process: QProcess) -> None:
         text = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        try:
+            too_new = schema_too_new(json.loads(text))
+        except json.JSONDecodeError:
+            too_new = False
         caps = parse_capabilities(text) if code == 0 else None
+        if too_new:
+            self.status.setText(UPDATE_MESSAGE)
+            return
         if caps is None:
             self.status.setText("Could not read capabilities")
             return
@@ -302,6 +319,8 @@ class TrayApp:
     def __init__(self, app: QApplication) -> None:
         self.view: View | None = None
         self.health, self.percent = Health.UNKNOWN, None
+        self.indeterminate = False
+        self.spin = 0
         self.log_window: LogWindow | None = None
         self.settings_window: SettingsWindow | None = None
         self.runner: QProcess | None = None
@@ -322,6 +341,10 @@ class TrayApp:
         self.debounce.timeout.connect(self.refresh)
         self.fallback = QTimer(interval=FALLBACK_MS)
         self.fallback.timeout.connect(self.on_fallback)
+        self.poll = QTimer(interval=POLL_MS)
+        self.poll.timeout.connect(self.on_poll)
+        self.report: dict | None = None
+        self.ticks = 0
         self.watcher = QFileSystemWatcher()
         self.watcher.directoryChanged.connect(self.on_state_changed)
         self.watcher.fileChanged.connect(self.on_state_changed)
@@ -351,7 +374,34 @@ class TrayApp:
         dark = QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
         ratio = max(2.0, QGuiApplication.primaryScreen().devicePixelRatio())
         spec = icon_spec(self.health, sys.platform == "darwin", dark)
-        self.tray.setIcon(make_icon(self.health, self.percent, spec, ratio))
+        self.tray.setIcon(make_icon(self.health, self.percent, spec, ratio, self.spin))
+
+    def set_polling(self, running: bool) -> None:
+        """The 1 s poll exists only while a run is in progress."""
+        if running and not self.poll.isActive():
+            self.ticks = 0
+            self.poll.start()
+        elif not running and self.poll.isActive():
+            self.poll.stop()
+            self.spin = 0
+
+    def on_poll(self) -> None:
+        self.ticks += 1
+        if self.view is not None and self.view.indeterminate and self.view.health is Health.RUNNING:
+            self.spin = (self.spin + SPIN_DEGREES) % 360
+        self.show_view(load_view(self.report))
+        if self.log_window is not None and self.log_window.isVisible():
+            self.log_window.refresh()
+        if self.ticks % STATUS_EVERY_TICKS == 0:
+            self.refresh()
+
+    def show_view(self, view: View) -> None:
+        self.view = view
+        self.health, self.percent, self.indeterminate = view.health, view.percent, view.indeterminate
+        self.update_icon()
+        self.tray.setToolTip(f"tenon: {view.headline}")
+        if self.log_window is not None:
+            self.log_window.current = view.current_log
 
     def show_settings(self) -> None:
         if self.settings_window is None:
@@ -361,7 +411,7 @@ class TrayApp:
     def start_apply(self) -> None:
         """macOS applies need no password; Linux asks for one unless sudo is passwordless."""
         if sys.platform == "darwin" or sudo_is_passwordless():
-            QProcess.startDetached(str(CLI), ["apply"])
+            self.start_run(["apply"])
         else:
             self.run_with_password(["apply"])
 
@@ -370,9 +420,35 @@ class TrayApp:
         if answer != QMessageBox.StandardButton.Yes:
             return
         if sudo_is_passwordless():
-            QProcess.startDetached(str(CLI), ["upgrade", "--yes"])
+            self.start_run(["upgrade", "--yes"])
         else:
             self.run_with_password(["upgrade", "--yes"])
+
+    def start_run(self, args: list[str]) -> None:
+        """Runs the CLI as our child so its exit code surfaces; Quit asks first because the child dies with us."""
+        process = self.runner = QProcess()
+        process.setStandardOutputFile(QProcess.nullDevice())
+        process.finished.connect(lambda code, _: self.on_run_finished(code, process))
+        process.errorOccurred.connect(lambda error: error is QProcess.ProcessError.FailedToStart
+                                      and QMessageBox.critical(None, "tenon", "tenon is not installed"))
+        process.start(str(CLI), args)
+
+    def on_run_finished(self, code: int, process: QProcess) -> None:
+        self.refresh()
+        if code == 0:
+            return
+        if password_outcome(code) == "busy":
+            QMessageBox.information(None, "tenon", BUSY_MESSAGE)
+            return
+        error = stderr_tail(bytes(process.readAllStandardError()).decode(errors="replace"))
+        QMessageBox.critical(None, "tenon", error or f"tenon exited with {code}")
+
+    def request_quit(self) -> None:
+        if self.runner is not None and self.runner.state() != QProcess.ProcessState.NotRunning:
+            answer = QMessageBox.question(None, "tenon", "A run is in progress, quit anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        quit_app()
 
     def run_with_password(self, args: list[str]) -> None:
         """Feeds the password to the CLI on stdin only; progress shows through the state files."""
@@ -394,6 +470,8 @@ class TrayApp:
                               QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel)
             if box.exec() == QMessageBox.StandardButton.Retry:
                 self.run_with_password(args)
+        elif outcome == "busy":
+            QMessageBox.information(None, "tenon", BUSY_MESSAGE)
         elif outcome == "error":
             QMessageBox.critical(None, "tenon", f"tenon rejected `{' '.join(args)}`.")
 
@@ -426,16 +504,16 @@ class TrayApp:
         self.apply_report(parse_report(text) if ok else None)
 
     def apply_report(self, report: dict | None) -> None:
-        previous, self.view = self.view, load_view(report)
+        previous = self.view
+        self.report = report
+        self.show_view(load_view(report))
         view = self.view
         finished = ((report or {}).get("last_run") or {}).get("finished")
         run_completed = report is not None and self.seen_report and finished != self.last_finished
         if report is not None:
             self.seen_report, self.last_finished = True, finished
-        self.health, self.percent = view.health, view.percent
-        self.update_icon()
-        self.tray.setToolTip(f"tenon: {view.headline}")
-        if previous and previous.health is Health.RUNNING and view.health is not Health.RUNNING:
+        self.set_polling(view.health in RUN_HEALTH)
+        if previous and previous.health in RUN_HEALTH and view.health not in RUN_HEALTH:
             failed = view.health is Health.FAILED
             self.tray.showMessage("tenon", view.last_run or view.headline,
                                   QSystemTrayIcon.MessageIcon.Critical if failed
@@ -479,7 +557,7 @@ class TrayApp:
             orphans.addSeparator()
             orphans.addAction("Nothing is deleted automatically").setEnabled(False)
         menu.addSeparator()
-        idle = view.health is not Health.RUNNING
+        idle = view.health not in RUN_HEALTH
         self.add_run(menu, "Check for drift", ["check"], idle)
         apply = QAction("Apply now", menu)
         apply.setEnabled(idle)
@@ -507,14 +585,13 @@ class TrayApp:
                 recent.addAction(item)
         menu.addSeparator()
         quit_action = QAction("Quit", menu)
-        quit_action.triggered.connect(quit_app)
+        quit_action.triggered.connect(self.request_quit)
         menu.addAction(quit_action)
 
-    @staticmethod
-    def add_run(menu: QMenu, text: str, args: list[str], enabled: bool) -> None:
+    def add_run(self, menu: QMenu, text: str, args: list[str], enabled: bool) -> None:
         action = QAction(text, menu)
         action.setEnabled(enabled)
-        action.triggered.connect(lambda: QProcess.startDetached(str(CLI), args))
+        action.triggered.connect(lambda: self.start_run(args))
         menu.addAction(action)
 
 

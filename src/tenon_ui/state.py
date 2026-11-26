@@ -18,11 +18,14 @@ STALLED_SECONDS = 300
 LISTED_FAILED = 6
 LISTED_CHANGED = 10
 LISTED_ORPHANS = 10
+SCHEMA_VERSION = 1
+UPDATE_MESSAGE = "Update tenon-ui: tenon reports a newer data format than this app reads"
 
 
 class Health(Enum):
     UNKNOWN = "unknown"
     RUNNING = "running"
+    STALLED = "stalled"
     OK = "ok"
     FAILED = "failed"
     DRIFT = "drift"
@@ -46,6 +49,8 @@ class View:
     runs: tuple["RunRow", ...]
     orphans: tuple[str, ...]
     schedule: str
+    indeterminate: bool
+    current_log: Path | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,8 @@ class Capability:
 
 EXIT_USAGE = 64
 EXIT_BAD_PASSWORD = 65
+EXIT_BUSY = 75
+BUSY_MESSAGE = "A run is already in progress"
 
 
 def schedule_line(report: dict | None) -> str:
@@ -69,14 +76,26 @@ def schedule_line(report: dict | None) -> str:
 
 
 def password_outcome(code: int) -> str:
-    """What a privileged run's exit code asks of the UI: 'retry' (wrong password), 'error' (bad usage) or 'done'."""
-    return {EXIT_BAD_PASSWORD: "retry", EXIT_USAGE: "error"}.get(code, "done")
+    """What a privileged run's exit code asks of the UI: 'retry' (wrong password), 'error' (bad usage), 'busy' or 'done'."""
+    return {EXIT_BAD_PASSWORD: "retry", EXIT_USAGE: "error", EXIT_BUSY: "busy"}.get(code, "done")
+
+
+def schema_too_new(data: object) -> bool:
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    return isinstance(version, int) and version > SCHEMA_VERSION
+
+
+def stderr_tail(text: str, lines: int = 12) -> str:
+    return "\n".join(text.strip().splitlines()[-lines:])
 
 
 def parse_capabilities(text: str) -> list[Capability] | None:
     """Parses `tenon capabilities --json`, sorted by layer then id; None when it is not that."""
     try:
-        rows = json.loads(text)["capabilities"]
+        data = json.loads(text)
+        if schema_too_new(data):
+            return None
+        rows = data["capabilities"]
         caps = [Capability(r["id"], r.get("desc") or "", r.get("layer") or "", bool(r["selected"]), bool(r["active"]))
                 for r in rows]
     except (json.JSONDecodeError, KeyError, TypeError):
@@ -151,21 +170,36 @@ def _run_row(entry: dict) -> RunRow:
     return RunRow(text, Path(log) if log and Path(log).exists() else None)
 
 
-def _running(progress: list[dict], progress_age: float | None) -> dict | None:
-    if not progress or progress[-1].get("event") == "end":
+def _running(report: dict | None, progress: list[dict], progress_age: float | None) -> dict | None:
+    """The run in progress: `current_run` (run.lock is the truth) when the engine reports it, else progress.jsonl."""
+    live = progress if progress and progress[-1].get("event") != "end" else []
+    if report and "current_run" in report:
+        current = report["current_run"]
+        if not current:
+            return None
+        last = live[-1] if live else {}
+        total = current.get("total") or (live[0].get("total_estimate") or 0 if live else 0)
+        launching = current.get("phase") == "launching"
+        return {"mode": current.get("mode") or "?", "launching": launching, "stalled": current.get("phase") == "stalled",
+                "indeterminate": bool(current.get("indeterminate")) or launching or not total,
+                "n": last.get("n") or current.get("n") or 0, "total": total,
+                "task": last.get("task") or current.get("task") or "", "log": current.get("log")}
+    if not live or progress_age is None or progress_age >= STALLED_SECONDS:
         return None
-    if progress_age is None or progress_age >= STALLED_SECONDS:
-        return None
-    head, last = progress[0], progress[-1]
-    return {"mode": head.get("mode", "?"), "launching": head.get("event") == "launching",
-            "n": last.get("n", 0), "total": head.get("total_estimate") or 0,
-            "task": last.get("task", "")}
+    head, last = live[0], live[-1]
+    launching = head.get("event") == "launching"
+    total = head.get("total_estimate") or 0
+    return {"mode": head.get("mode", "?"), "launching": launching, "stalled": False,
+            "indeterminate": launching or not total, "n": last.get("n", 0), "total": total,
+            "task": last.get("task", ""), "log": head.get("log")}
 
 
 def build_view(report: dict | None, progress: list[dict], progress_age: float | None,
                history: list[dict], manifest: dict | None) -> View:
+    if schema_too_new(report):
+        return View(Health.UNKNOWN, None, UPDATE_MESSAGE, "", "", (), (), "", "", None, False, 0, (), (), "", False, None)
     status = (report or {}).get("last_run")
-    run = _running(progress, progress_age)
+    run = _running(report, progress, progress_age)
     failed = tuple(_label(e) for e in (status or {}).get("failed") or [])
     changed = tuple(_label(e) for e in (status or {}).get("changed") or [])
     # `changed` under check means drift; under apply it means drift repaired.
@@ -175,14 +209,16 @@ def build_view(report: dict | None, progress: list[dict], progress_age: float | 
 
     percent = None
     if run:
-        health = Health.RUNNING
-        if run["launching"]:
+        health = Health.STALLED if run["stalled"] else Health.RUNNING
+        if run["stalled"]:
+            headline, detail = f"{run['mode']}: stalled at task {run['n']}", run["task"]
+        elif run["launching"]:
             headline, detail = f"Starting {run['mode']}: syncing layers", ""
         else:
             of = f" of {run['total']}" if run["total"] else ""
             headline = f"{run['mode']}: task {run['n']}{of}"
             detail = run["task"]
-            if run["total"]:
+            if not run["indeterminate"]:
                 percent = min(100, 100 * run["n"] // run["total"])
     elif status is None:
         health, headline, detail = Health.UNKNOWN, "No run recorded yet", ""
@@ -217,7 +253,9 @@ def build_view(report: dict | None, progress: list[dict], progress_age: float | 
     return View(health, percent, headline, detail, last_run, failed[:LISTED_FAILED],
                 changed[:LISTED_CHANGED], sync, managed, _existing_log(history),
                 bool((status or {}).get("partial")), max(0, len(changed) - LISTED_CHANGED),
-                runs, orphans[:LISTED_ORPHANS], schedule_line(report))
+                runs, orphans[:LISTED_ORPHANS], schedule_line(report),
+                bool(run and (run["indeterminate"] or run["stalled"])),
+                Path(run["log"]) if run and run["log"] else None)
 
 
 def latest_log(log_dir: Path) -> Path | None:
@@ -225,13 +263,16 @@ def latest_log(log_dir: Path) -> Path | None:
     return max(log_dir.glob("*.log"), default=None, key=lambda p: p.name)
 
 
-def next_log_chunk(log_dir: Path, shown: Path | None, offset: int) -> tuple[Path | None, int, str, bool]:
+def next_log_chunk(log_dir: Path, shown: Path | None, offset: int,
+                   current: Path | None = None) -> tuple[Path | None, int, str, bool]:
     """Returns (log, new offset, new text, replaced) for the window showing `shown` up to `offset`.
+
+    `current` is the running run's log; it wins over the newest file.
 
     `replaced` means a newer run's log took over (or the file shrank): the caller clears first.
     Only whole lines are returned; a partial last line waits for its newline.
     """
-    log = latest_log(log_dir)
+    log = current if current and current.exists() else latest_log(log_dir)
     if log is None:
         return None, 0, "", shown is not None
     try:

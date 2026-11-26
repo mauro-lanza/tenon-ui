@@ -137,3 +137,55 @@ def test_read_jsonl_skips_partial_line(tmp_path: Path):
     path.write_text(json.dumps({"a": 1}) + "\n{\"b\":")
     assert read_jsonl(path) == [{"a": 1}]
     assert read_jsonl(tmp_path / "missing") == []
+
+
+def current(**fields):
+    return {"schema_version": 1, "current_run": {"mode": "apply", "phase": "running", "total": 10, "n": 4,
+                                                 "task": "t", "log": "/l.log", **fields}}
+
+
+def test_current_run_drives_running_and_percent():
+    view = build_view(current(), [], None, [], None)
+    assert (view.health, view.percent, view.indeterminate, view.current_log) == (Health.RUNNING, 40, False, Path("/l.log"))
+    idle = build_view({"schema_version": 1, "current_run": None}, [{"event": "start"}], 1.0, [], None)
+    assert idle.health is not Health.RUNNING
+
+
+def test_indeterminate_for_launching_flag_or_unknown_total_and_stalled_is_distinct():
+    for report in (current(phase="launching"), current(indeterminate=True), current(total=0)):
+        view = build_view(report, [], None, [], None)
+        assert view.indeterminate and view.percent is None
+    stalled = build_view(current(phase="stalled"), [], None, [], None)
+    assert stalled.health is Health.STALLED and "stalled" in stalled.headline
+
+
+def test_current_run_prefers_fresher_progress_and_absent_fields_fall_back():
+    progress = [{"event": "start", "total_estimate": 10}, {"event": "task", "n": 7, "task": "x"}]
+    assert build_view(current(n=1), progress, 1.0, [], None).percent == 70
+    fallback = build_view(None, [{"event": "launching", "mode": "check", "log": "/f.log"}], 1.0, [], None)
+    assert fallback.health is Health.RUNNING and fallback.indeterminate and fallback.current_log == Path("/f.log")
+    assert build_view({"last_run": {"result": "ok"}}, [{"event": "start"}], 1.0, [], None).health is Health.RUNNING
+
+
+def test_lock_just_taken_reports_all_nulls_as_running_indeterminate(tmp_path):
+    report = {"schema_version": 1, "current_run": {"run_id": None, "mode": None, "started": None, "log": None,
+                                                   "task": None, "n": 0, "total": None}}
+    view = build_view(report, [], None, [], None)
+    assert (view.health, view.percent, view.indeterminate, view.current_log) == (Health.RUNNING, None, True, None)
+    newest = tmp_path / "20260101-000000-apply.log"
+    newest.write_text("x\n")
+    assert next_log_chunk(tmp_path, None, 0, view.current_log) == (newest, 2, "x\n", True)
+
+
+def test_unknown_schema_asks_for_an_update():
+    view = build_view({"schema_version": 2}, [], None, [], None)
+    assert view.health is Health.UNKNOWN and "Update tenon-ui" in view.headline
+    assert parse_capabilities('{"schema_version": 2, "capabilities": []}') is None
+    assert password_outcome(75) == "busy"
+
+
+def test_log_chunk_prefers_current_log(tmp_path):
+    (tmp_path / "2-new.log").write_text("n\n")
+    mine = tmp_path / "1-mine.log"
+    mine.write_text("m\n")
+    assert next_log_chunk(tmp_path, None, 0, mine)[:3] == (mine, 2, "m\n")
