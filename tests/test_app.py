@@ -12,10 +12,7 @@ from tenon_ui.state import Health
 def test_tray_builds_and_menu_renders():
     qt = QApplication.instance() or QApplication([])
     tray = tray_app.TrayApp(qt)
-    deadline = time.monotonic() + 15
-    while tray.view is None and time.monotonic() < deadline:
-        qt.processEvents()
-        time.sleep(0.02)
+    tray.apply_report({"last_run": {"mode": "apply", "result": "ok"}})
     assert tray.view is not None
     tray.on_menu_about_to_show()
     texts = [a.text() for a in tray.menu.actions()]

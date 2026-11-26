@@ -13,12 +13,13 @@ from PySide6.QtCore import QFileSystemWatcher, QPointF, QProcess, QRectF, Qt, QT
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon,
                            QPainter, QPainterPath, QPen, QPixmap, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
-                               QPlainTextEdit, QPushButton, QSystemTrayIcon, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QPlainTextEdit, QPushButton, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from tenon_ui.state import (BUSY_MESSAGE, CLI, LOG_DIR, STATE_DIR, UPDATE_MESSAGE, Capability, Health, View, latest_log,
-                            load_view, next_log_chunk, parse_capabilities, parse_report, password_outcome,
-                            schema_too_new, selection_commands, stderr_tail)
+from tenon_ui.state import (BUSY_MESSAGE, CLI, LOG_DIR, STATE_DIR, UPDATE_MESSAGE, Capability, Health, Orphan, View,
+                            forget_args, latest_log, load_view, needs_force, needs_password, next_log_chunk,
+                            orphan_count, parse_capabilities, parse_orphans, parse_report, parse_results,
+                            password_outcome, remove_args, schema_too_new, selection_commands, stderr_tail)
 
 AGENT_LABEL = "com.tenon.ui"
 LOG_MAX_LINES = 20_000
@@ -290,6 +291,147 @@ class SettingsWindow(QWidget):
         self.run_next()
 
 
+class OrphansWindow(QWidget):
+    """Lists what tenon no longer manages; the user removes (trash/uninstall) or forgets the ticked rows."""
+
+    COLUMNS = ["", "Kind", "Item", "Layer / capability", "Reason"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("tenon clean up")
+        self.resize(900, 480)
+        self.orphans: list[Orphan] = []
+        self.process: QProcess | None = None
+        self.table = QTableWidget(columnCount=len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.verticalHeader().hide()
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.status = QLabel("Loading\u2026")
+        self.remove_button = QPushButton("Remove selected")
+        self.remove_button.clicked.connect(self.remove)
+        self.forget_button = QPushButton("Forget selected")
+        self.forget_button.clicked.connect(self.forget)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.load)
+        note = QLabel("Remove moves files to ~/.local/share/tenon/backups/trash/ and uninstalls packages. "
+                      "Forget only stops listing them.")
+        buttons = QHBoxLayout()
+        buttons.addWidget(note, 1)
+        for button in (self.refresh_button, self.forget_button, self.remove_button):
+            buttons.addWidget(button)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.table)
+        layout.addWidget(self.status)
+        layout.addLayout(buttons)
+
+    def present(self) -> None:
+        self.load()
+        activate_window(self)
+
+    def run(self, args: list[str], on_done, password: str | None = None) -> None:
+        for button in (self.remove_button, self.forget_button, self.refresh_button):
+            button.setEnabled(False)
+        process = self.process = QProcess(self)
+        process.finished.connect(lambda code, _: on_done(code, bytes(process.readAllStandardOutput()).decode(errors="replace"),
+                                                        bytes(process.readAllStandardError()).decode(errors="replace")))
+        process.errorOccurred.connect(lambda error: error is QProcess.ProcessError.FailedToStart
+                                      and self.status.setText("tenon is not installed"))
+        process.start(str(CLI), args)
+        if password is not None:
+            process.write(password.encode() + b"\n")
+            process.closeWriteChannel()
+
+    def enable_buttons(self) -> None:
+        for button in (self.remove_button, self.forget_button, self.refresh_button):
+            button.setEnabled(True)
+
+    def load(self) -> None:
+        self.run(["orphans", "--json"], self.on_loaded)
+
+    def on_loaded(self, code: int, out: str, _err: str) -> None:
+        self.enable_buttons()
+        try:
+            too_new = schema_too_new(json.loads(out))
+        except json.JSONDecodeError:
+            too_new = False
+        orphans = parse_orphans(out) if code == 0 else None
+        if too_new:
+            self.status.setText(UPDATE_MESSAGE)
+        elif orphans is None:
+            self.status.setText("Could not read orphans")
+        else:
+            self.show_orphans(orphans)
+
+    def show_orphans(self, orphans: list[Orphan]) -> None:
+        self.orphans = orphans
+        self.table.setRowCount(len(orphans))
+        for row, orphan in enumerate(orphans):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            check.setCheckState(Qt.CheckState.Checked if orphan.preselected else Qt.CheckState.Unchecked)
+            self.table.setItem(row, 0, check)
+            cells = [orphan.kind, orphan.label, f"{orphan.layer} / {orphan.capability}", orphan.shown_reason]
+            for column, text in enumerate(cells, start=1):
+                self.table.setItem(row, column, QTableWidgetItem(text))
+        self.table.resizeColumnsToContents()
+        self.status.setText(f"{len(orphans)} item(s)")
+
+    def chosen(self) -> list[Orphan]:
+        return [o for row, o in enumerate(self.orphans) if self.table.item(row, 0).checkState() is Qt.CheckState.Checked]
+
+    def remove(self) -> None:
+        chosen = self.chosen()
+        if not chosen:
+            return
+        files = sum(not o.is_package for o in chosen)
+        text = (f"Move {files} file(s) to ~/.local/share/tenon/backups/trash/ and uninstall "
+                f"{len(chosen) - files} package(s)?")
+        if needs_force(chosen):
+            text += "\n\nThis includes files tenon cannot confirm are unchanged; they will be removed with --force."
+        if QMessageBox.question(self, "tenon", text) == QMessageBox.StandardButton.Yes:
+            self.start_remove(chosen)
+
+    def start_remove(self, chosen: list[Orphan]) -> None:
+        password = None
+        if needs_password(chosen) and not sudo_is_passwordless():
+            password = ask_password()
+            if password is None:
+                return
+        self.run(remove_args(chosen, password is not None),
+                 lambda code, out, err: self.on_removed(chosen, code, out, err), password)
+
+    def forget(self) -> None:
+        chosen = self.chosen()
+        if chosen:
+            self.run(forget_args(chosen), lambda code, out, err: self.on_done(code, out, err))
+
+    def on_removed(self, chosen: list[Orphan], code: int, out: str, err: str) -> None:
+        if password_outcome(code) == "retry":
+            self.enable_buttons()
+            box = QMessageBox(QMessageBox.Icon.Warning, "tenon", "Incorrect password. Nothing was removed.",
+                              QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel, self)
+            if box.exec() == QMessageBox.StandardButton.Retry:
+                self.start_remove(chosen)
+            return
+        self.on_done(code, out, err)
+
+    def on_done(self, code: int, out: str, err: str) -> None:
+        self.enable_buttons()
+        if password_outcome(code) == "busy":
+            QMessageBox.information(self, "tenon", BUSY_MESSAGE)
+            return
+        results = parse_results(out)
+        if results is None:
+            QMessageBox.critical(self, "tenon", stderr_tail(err) or f"tenon exited with {code}")
+        else:
+            labels = {o.id: o.label for o in self.orphans}
+            lines = [f"{'OK' if ok else 'Failed'}: {labels.get(id_, id_)}{'' if ok or not message else f': {message}'}"
+                     for id_, ok, message in results]
+            box = QMessageBox.warning if any(not ok for _, ok, _ in results) else QMessageBox.information
+            box(self, "tenon", "\n".join(lines))
+        self.load()
+
+
 def install_signature() -> tuple:
     """Name, mtime and size of every installed source file; a reinstall rewrites them."""
     return tuple((p.name, s.st_mtime_ns, s.st_size) for p in sorted(PACKAGE_DIR.glob("*.py")) for s in [p.stat()])
@@ -323,6 +465,7 @@ class TrayApp:
         self.spin = 0
         self.log_window: LogWindow | None = None
         self.settings_window: SettingsWindow | None = None
+        self.orphans_window: OrphansWindow | None = None
         self.runner: QProcess | None = None
         self.tray = QSystemTrayIcon()
         self.update_icon()
@@ -358,6 +501,7 @@ class TrayApp:
         self.fallback.start()
         self.tray.show()
         app.aboutToQuit.connect(self.tray.hide)
+        app.aboutToQuit.connect(self.status.kill)
 
     def watch_state(self) -> None:
         # Files replaced atomically drop their watch, so re-add on every change.
@@ -407,6 +551,11 @@ class TrayApp:
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self.start_apply)
         self.settings_window.present()
+
+    def show_orphans(self) -> None:
+        if self.orphans_window is None:
+            self.orphans_window = OrphansWindow()
+        self.orphans_window.present()
 
     def start_apply(self) -> None:
         """macOS applies need no password; Linux asks for one unless sudo is passwordless."""
@@ -551,12 +700,6 @@ class TrayApp:
         label(view.sync)
         label(view.managed)
         label(view.schedule)
-        if view.orphans:
-            orphans = menu.addMenu("No longer managed, still on disk")
-            for path in view.orphans:
-                orphans.addAction(path).setEnabled(False)
-            orphans.addSeparator()
-            orphans.addAction("Nothing is deleted automatically").setEnabled(False)
         menu.addSeparator()
         idle = view.health not in RUN_HEALTH
         self.add_run(menu, "Check for drift", ["check"], idle)
@@ -572,6 +715,11 @@ class TrayApp:
         settings = QAction("Capabilities\u2026", menu)
         settings.triggered.connect(self.show_settings)
         menu.addAction(settings)
+        orphans = orphan_count(self.report)
+        if orphans:
+            cleanup = QAction(f"Clean up\u2026 ({orphans})", menu)
+            cleanup.triggered.connect(self.show_orphans)
+            menu.addAction(cleanup)
         if latest_log(LOG_DIR):
             show_log = QAction("Show log", menu)
             show_log.triggered.connect(self.show_log)

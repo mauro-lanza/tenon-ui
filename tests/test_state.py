@@ -98,10 +98,9 @@ def test_manifest_and_log(tmp_path: Path):
     log = tmp_path / "run.log"
     log.write_text("")
     history = [{"log": str(log)}, {"log": str(tmp_path / "pruned.log")}]
-    manifest = {"files": [1, 2], "orphans": [{"path": "/x"}]}
-    view = build_view(run(), [], None, history, manifest)
+    view = build_view(run(), [], None, history, {"files": [1, 2]})
     assert view.log == log
-    assert view.managed == "Manages 2 files, 1 no longer managed"
+    assert view.managed == "Manages 2 files"
 
 
 def test_recent_runs_newest_first_with_log_only_when_it_exists(tmp_path: Path):
@@ -118,13 +117,10 @@ def test_recent_runs_newest_first_with_log_only_when_it_exists(tmp_path: Path):
     assert rows[1].log is None
 
 
-def test_orphans_are_capped_and_partial_is_reported():
-    manifest = {"files": [], "orphans": [{"path": f"/o{i}"} for i in range(12)]}
+def test_partial_is_reported():
     report = run()
     report["last_run"]["partial"] = True
-    view = build_view(report, [], None, [], manifest)
-    assert view.partial
-    assert view.orphans == tuple(f"/o{i}" for i in range(10))
+    assert build_view(report, [], None, [], {"files": []}).partial
 
 
 def test_changed_list_is_capped_with_remainder():

@@ -17,7 +17,6 @@ LOG_DIR = Path.home() / ("Library/Logs/tenon" if sys.platform == "darwin" else "
 STALLED_SECONDS = 300
 LISTED_FAILED = 6
 LISTED_CHANGED = 10
-LISTED_ORPHANS = 10
 SCHEMA_VERSION = 1
 UPDATE_MESSAGE = "Update tenon-ui: tenon reports a newer data format than this app reads"
 
@@ -47,7 +46,6 @@ class View:
     partial: bool
     changed_more: int
     runs: tuple["RunRow", ...]
-    orphans: tuple[str, ...]
     schedule: str
     indeterminate: bool
     current_log: Path | None
@@ -111,6 +109,84 @@ def selection_commands(selected: set[str], wanted: set[str]) -> list[list[str]]:
     if selected - wanted:
         commands.append(["capabilities", "deselect", *sorted(selected - wanted)])
     return commands
+
+
+@dataclass(frozen=True)
+class Orphan:
+    id: str
+    kind: str
+    manager: str | None
+    path: str | None
+    name: str | None
+    layer: str
+    capability: str
+    safe: bool
+    reason: str
+
+    @property
+    def is_package(self) -> bool:
+        return self.kind == "package"
+
+    @property
+    def label(self) -> str:
+        if self.is_package:
+            return f"{self.name} ({self.manager})"
+        return self.path or self.id
+
+    @property
+    def shown_reason(self) -> str:
+        return PACKAGE_REASON if self.is_package else self.reason
+
+    @property
+    def preselected(self) -> bool:
+        return not self.is_package and self.safe
+
+
+PACKAGE_REASON = "may have been installed before tenon"
+
+
+def orphan_count(report: dict | None) -> int:
+    count = (report or {}).get("orphans")
+    return count if isinstance(count, int) else 0
+
+
+def parse_orphans(text: str) -> list[Orphan] | None:
+    """Parses `tenon orphans --json`; None when it is not that or the schema is too new."""
+    try:
+        data = json.loads(text)
+        if schema_too_new(data):
+            return None
+        return [Orphan(r["id"], r["kind"], r.get("manager"), r.get("path"), r.get("name"), r.get("layer") or "",
+                       r.get("capability") or "", bool(r.get("safe")), r.get("reason") or "")
+                for r in data["orphans"]]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def needs_force(chosen: list[Orphan]) -> bool:
+    return any(not o.is_package and not o.safe for o in chosen)
+
+
+def needs_password(chosen: list[Orphan]) -> bool:
+    return any(o.manager == "cask" for o in chosen)
+
+
+def remove_args(chosen: list[Orphan], password: bool) -> list[str]:
+    """`tenon orphans remove` arguments: --force only for an unsafe file, --password-stdin only when a password is piped."""
+    return ["orphans", "remove", "--json", *(["--force"] if needs_force(chosen) else []),
+            *(["--password-stdin"] if password else []), *(o.id for o in chosen)]
+
+
+def forget_args(chosen: list[Orphan]) -> list[str]:
+    return ["orphans", "forget", "--json", *(o.id for o in chosen)]
+
+
+def parse_results(text: str) -> list[tuple[str, bool, str]] | None:
+    """(id, ok, message) rows of a remove/forget `--json` reply; None when unreadable."""
+    try:
+        return [(r["id"], bool(r["ok"]), r.get("message") or "") for r in json.loads(text)["results"]]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -197,7 +273,7 @@ def _running(report: dict | None, progress: list[dict], progress_age: float | No
 def build_view(report: dict | None, progress: list[dict], progress_age: float | None,
                history: list[dict], manifest: dict | None) -> View:
     if schema_too_new(report):
-        return View(Health.UNKNOWN, None, UPDATE_MESSAGE, "", "", (), (), "", "", None, False, 0, (), (), "", False, None)
+        return View(Health.UNKNOWN, None, UPDATE_MESSAGE, "", "", (), (), "", "", None, False, 0, (), "", False, None)
     status = (report or {}).get("last_run")
     run = _running(report, progress, progress_age)
     failed = tuple(_label(e) for e in (status or {}).get("failed") or [])
@@ -244,16 +320,12 @@ def build_view(report: dict | None, progress: list[dict], progress_age: float | 
     managed = ""
     if manifest:
         managed = f"Manages {len(manifest.get('files') or [])} files"
-        orphans = len(manifest.get("orphans") or [])
-        if orphans:
-            managed += f", {orphans} no longer managed"
 
     runs = tuple(_run_row(entry) for entry in reversed(history))
-    orphans = tuple(str(e.get("path")) for e in (manifest or {}).get("orphans") or [])
     return View(health, percent, headline, detail, last_run, failed[:LISTED_FAILED],
                 changed[:LISTED_CHANGED], sync, managed, _existing_log(history),
                 bool((status or {}).get("partial")), max(0, len(changed) - LISTED_CHANGED),
-                runs, orphans[:LISTED_ORPHANS], schedule_line(report),
+                runs, schedule_line(report),
                 bool(run and (run["indeterminate"] or run["stalled"])),
                 Path(run["log"]) if run and run["log"] else None)
 
